@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+settings.json
+.claude/
+.claude.json
+
+# Exported/converted files
+lng/*.csv
+lng/*.json
+lng/*.xml
+
+# Large binary game assets (fonts, textures)
+content/textures/
+
+# Sample/example game files (not needed for the tool itself)
+ex file/
+content/localization/
+lng/
