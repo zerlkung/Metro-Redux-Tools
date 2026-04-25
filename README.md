@@ -15,7 +15,7 @@ Mod tools for **Metro 2033 Redux** & **Metro Last Light Redux** (PC / PS4) — V
 | **VFS0 Archive** | Read VFS0 data archives, extract GUID and data size |
 | **Mod Builder** | Create VFS0 archives with VFX index for modding |
 | **.lng Localization** | Export/import `.lng` files to JSON/CSV with full Unicode support |
-| **Texture Export** | Export `.512`/`.1024`/`.2048` textures to **PNG**, **DDS (BC7)**, **Legacy DDS (RGBA)**, **TGA** |
+| **Texture Export** | Export `.512`/`.1024`/`.2048` textures to **PNG**, **DDS (BC7/BC4/BC1)**, **Legacy DDS (RGBA)**, **TGA** — auto-detects BC7, BC4 (PS4 SDF fonts), BC1 (PC fonts) |
 | **Texture Import** | Import PNG → rebuild `.512` with BC7 + LZ4 compression |
 | **QuickBMS Integration** | Auto-detect and run QuickBMS for compressed extraction |
 | **PS4 Support** | Supports both PC and PS4 platform file structures |
@@ -28,7 +28,7 @@ Mod tools for **Metro 2033 Redux** & **Metro Last Light Redux** (PC / PS4) — V
 | **VFS0 Archive** | อ่าน VFS0 data archives, ดึง GUID และ data size |
 | **Mod Builder** | สร้าง VFS0 archives พร้อม VFX index สำหรับ modding |
 | **.lng Localization** | Export/Import ไฟล์ `.lng` เป็น JSON/CSV รองรับ Unicode เต็มรูปแบบ |
-| **Texture Export** | Export ไฟล์ `.512`/`.1024`/`.2048` เป็น **PNG**, **DDS (BC7)**, **Legacy DDS (RGBA)**, **TGA** |
+| **Texture Export** | Export ไฟล์ `.512`/`.1024`/`.2048` เป็น **PNG**, **DDS (BC7/BC4/BC1)**, **Legacy DDS (RGBA)**, **TGA** — ตรวจ format อัตโนมัติ: BC7, BC4 (PS4 SDF font), BC1 (PC font) |
 | **Texture Import** | Import PNG → สร้าง `.512` ใหม่ด้วย BC7 + LZ4 compression |
 | **QuickBMS Integration** | ตรวจจับและรัน QuickBMS อัตโนมัติสำหรับไฟล์ที่ถูกบีบอัด |
 | **PS4 Support** | รองรับโครงสร้างไฟล์ทั้ง PC และ PS4 |
@@ -92,6 +92,39 @@ The character table has **294 entries** arranged by frequency:
 - English-only strings decode correctly with simple 1-byte lookup / สตริงภาษาอังกฤษถอดรหัสด้วย 1 ไบต์ได้ถูกต้อง
 - Thai/Japanese strings **require** the 2-byte decoding logic / สตริงภาษาไทย/ญี่ปุ่น **ต้องใช้** logic ถอดรหัส 2 ไบต์
 - Mixed-language strings (e.g., Thai + English) use both encodings in the same value / สตริงผสมภาษาใช้ทั้ง 2 รูปแบบในค่าเดียวกัน
+
+---
+
+## Texture Format Detection / การตรวจจับรูปแบบ Texture
+
+Metro Redux ใช้ texture format ที่แตกต่างกันตาม platform และประเภทไฟล์:
+
+| Format | Platform | ไฟล์ | การถอดรหัส |
+|--------|----------|------|------------|
+| **BC7** (DXGI 98) | PC | texture ทั่วไป | decode_bc7, RGBA |
+| **BC4 SDF** (DXGI 80) | PS4 | font atlas (`.512` มี 10 mips, `.1024` มี 1 mip) | decode_bc4, Blue channel + SDF remap |
+| **BC1** (DXGI 71) | PC | font atlas (`.512`/`.1024` ขนาด 1024×1024) | decode_bc1, R channel |
+
+### Font Atlas Encoding / การเข้ารหัส Font Atlas
+
+**PC (BC1 / DXT1)**:
+- ขนาดไฟล์ `.512` = 524,288 bytes = 1024×1024 single mip (เก็บ mip ใหญ่ใน `.512`)
+- color0 = black (`0x0000` RGB565), color1 = white (`0xFFFF`) — hard-edge glyph mask
+- ตัวอักษรเป็นขาว-ดำ ไม่มี anti-aliasing gradient
+
+**PS4 (BC4 SDF)**:
+- `.512` = 174,776 bytes = 512×512 + full mip chain (10 levels)
+- `.1024` = 524,288 bytes = 1024×1024 single mip
+- ใช้ Signed Distance Field: ค่า 128 = ขอบตัวอักษร, >128 = ด้านใน, <128 = ด้านนอก
+- export PNG จะ remap [80..176] → [0..255] เพื่อให้ขอบคมชัด
+
+### Auto-detection / ตรวจจับอัตโนมัติ
+
+เครื่องมือตรวจ format โดย:
+1. ลอง LZ4 decompress → BC7 (texture ทั่วไป)
+2. ตรวจ file size กับ BC7 mip chain
+3. ตรวจ file size กับ BC4/BC1 mip chain → ใช้ `_sniff_bc1_or_bc4()` อ่าน endpoint bytes เพื่อแยก BC4 SDF (ep0 > 128) จาก BC1 (ep0 = 0)
+4. ตรวจ BC4/BC1 single mip ที่ 2× dimension (PC `.512` → 1024×1024)
 
 ---
 
@@ -187,6 +220,7 @@ Metro Redux Tools/
 | Project | What we used |
 |---------|-------------|
 | [MetroEX](https://github.com/ShokerStlk/MetroEX) | VFX file format, LZ4 DecompressBlob/DecompressStream, texture export (DDS DX10/DX9, TGA, PNG), BC7 handling |
+| [MetroTC](https://github.com/iOrange/MetroTC) | Font texture format research — confirmed PC fonts use BC1 (DXT1) 174,776-byte = BC1 identification |
 | [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) | Modern Python GUI framework with dark mode, rounded widgets, tabbed interface |
 | [OpenXRay](https://github.com/OpenXRay/xray-16) | General X-Ray engine file format understanding |
 

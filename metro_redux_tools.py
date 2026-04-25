@@ -601,74 +601,203 @@ def _bc7_mip_chain_sizes(dimension: int) -> list[int]:
     return sizes
 
 
-def parse_texture_512(data: bytes, dimension: int, num_mips: int) -> bytes | None:
-    """Decompress a .512/.1024/.2048 file → raw BC7 blocks.
+def _bc4_mip_chain_sizes(dimension: int) -> list[int]:
+    """Return BC4/BC1 byte sizes for each mip level (4×4 blocks, 8 bytes each).
 
-    Tries LZ4 blob decompression first (MetroEX DecompressBlob style).
-    Falls back to raw BC7 if the file size matches the expected size
-    (some textures like font atlases are stored uncompressed).
+    Both BC4 (single-channel SDF) and BC1 (DXT1 hard-edge) use 8 bytes per
+    4×4 block.  Supports the full mip chain down to 1×1 (padded to 1 block).
     """
-    expected = sum(_bc7_mip_chain_sizes(dimension)[:num_mips])
-    # Try LZ4 decompress (single blob, no linked blocks)
+    sizes = []
+    d = dimension
+    while d >= 1:
+        blocks = max(d // 4, 1) * max(d // 4, 1)
+        sizes.append(blocks * 8)
+        d //= 2
+    return sizes
+
+
+def _sniff_bc1_or_bc4(data: bytes) -> str:
+    """Determine whether 8-byte-block texture data is BC1 (DXT1) or BC4.
+
+    PS4 fonts use BC4 (single-channel SDF): endpoint bytes 0 and 1 vary
+    widely across blocks — the inside-glyph endpoint is typically >128 and
+    the outside-glyph endpoint is near 0, giving a smooth distance gradient.
+
+    PC fonts use BC1 (DXT1 hard-edge): color0 (bytes 0-1) is always 0x0000
+    (black in RGB565) and color1 (bytes 2-3) is either 0x0000 (empty block)
+    or 0xFFFF (white), so byte 0 of every block is 0x00.
+
+    Returns 'bc4' if any sampled block looks like a BC4 SDF gradient block,
+    otherwise 'bc1'.
+    """
+    block_count = len(data) // 8
+    sample = min(512, block_count)
+    step = max(1, block_count // sample)
+    for i in range(0, block_count, step):
+        ep0 = data[i * 8]
+        ep1 = data[i * 8 + 1]
+        # BC4 SDF block: high inside-endpoint >> low outside-endpoint
+        if ep0 > 128 and ep1 < 64:
+            return 'bc4'
+    return 'bc1'
+
+
+def parse_texture_512(data: bytes, dimension: int, num_mips: int,
+                      ) -> tuple[bytes | None, str, int]:
+    """Detect format and decompress/read a .512/.1024/.2048 texture file.
+
+    Returns (raw_bc_data, tex_format, actual_dimension) where:
+      tex_format      : 'bc7' for standard game textures,
+                        'bc4' for single-channel font atlases
+      actual_dimension: detected real texture size — PC font .512 files may
+                        contain a 1024×1024 BC4 mip despite the .512 extension
+
+    Returns (None, '', dimension) on failure.
+
+    Detection order:
+      1. LZ4 → BC7  (standard game textures, compressed blob)
+      2. Raw BC7 exact size  (uncompressed game textures)
+      3. Raw BC4 exact full-mip-chain size  (PS4/PC font atlases at nominal dim)
+      4. Raw BC4 single mip at 2× dimension  (PC font .512 → 1024×1024 BC4)
+      5. Raw BC7 size ≥ expected fallback
+    """
+    # ── 1 & 2: BC7 path (standard game textures) ──────────────────────────────
+    bc7_expected = sum(_bc7_mip_chain_sizes(dimension)[:num_mips])
     if LZ4_OK:
         try:
-            out = _lz4.decompress(data, uncompressed_size=expected)
-            if len(out) == expected:
-                return out
+            out = _lz4.decompress(data, uncompressed_size=bc7_expected)
+            if len(out) == bc7_expected:
+                return out, 'bc7', dimension
         except Exception:
             pass
-    # Fall back: raw BC7 (not compressed)
-    if len(data) >= expected:
-        return data[:expected]
-    return None
+    if len(data) == bc7_expected:
+        return data, 'bc7', dimension
+
+    # ── 3: 8-bpp block (BC4 or BC1) at nominal dimension ─────────────────────
+    # PS4 .512 font = 174,776 B  (512×512 BC4, 10 mips)
+    # PS4 .1024 font = 524,288 B (1024×1024 BC4, 1 mip)
+    # PC  .512/.1024 = 524,288 B (1024×1024 BC1, 1 mip — upscaled from dim)
+    bc8_expected = sum(_bc4_mip_chain_sizes(dimension)[:num_mips])
+    if len(data) == bc8_expected:
+        fmt = _sniff_bc1_or_bc4(data)
+        return data, fmt, dimension
+
+    # ── 4: 8-bpp single top-mip at 2× the nominal dimension ──────────────────
+    # PC .512 font files store a 1024×1024 texture in the .512 file = 524,288 B
+    if dimension in (512, 1024):
+        upscaled = dimension * 2
+        bc8_mip0 = max(upscaled // 4, 1) ** 2 * 8
+        if len(data) == bc8_mip0:
+            fmt = _sniff_bc1_or_bc4(data)
+            return data, fmt, upscaled
+
+    # ── 5: Raw BC7 fallback ────────────────────────────────────────────────────
+    if len(data) >= bc7_expected:
+        return data[:bc7_expected], 'bc7', dimension
+
+    return None, '', dimension
 
 
-def export_texture_to_png(bc7_data: bytes, dimension: int, path: str) -> None:
-    """Decode the top mip level of BC7 data and save as PNG."""
+def export_texture_to_png(bc_data: bytes, dimension: int, path: str,
+                          tex_fmt: str = 'bc7') -> None:
+    """Decode the top mip level and save as PNG.
+
+    tex_fmt 'bc7' → RGBA PNG.
+    tex_fmt 'bc4' → grayscale PNG with SDF decode applied so glyph edges are
+                    crisp and readable.  Metro Redux font atlases are SDF
+                    textures where the raw BC4 value is a distance field:
+                    128 = glyph edge, >128 = inside, <128 = outside.
+                    We remap [SDF_LO..SDF_HI] → [0..255] to recover sharp edges
+                    with smooth anti-aliasing; raw BC4 data is preserved in DDS.
+    """
     if not TEXDEC_OK:
         raise RuntimeError("pip install texture2ddecoder")
     if not PIL_OK:
         raise RuntimeError("pip install Pillow")
-    mip0_size = (dimension // 4) * (dimension // 4) * 16
-    mip0 = bc7_data[:mip0_size]
-    rgba = _t2d.decode_bc7(mip0, dimension, dimension)
-    img = _Img.frombytes("RGBA", (dimension, dimension), rgba)
-    img.save(path)
+    if tex_fmt == 'bc4':
+        mip0_size = max(dimension // 4, 1) ** 2 * 8
+        rgba = _t2d.decode_bc4(bc_data[:mip0_size], dimension, dimension)
+        img  = _Img.frombytes("RGBA", (dimension, dimension), rgba)
+        # BC4 value is in the Blue channel
+        gray = img.split()[2]
+        # SDF fonts are resolution-independent distance fields.
+        # Upscale the raw distance field 2× with bilinear interpolation
+        # BEFORE thresholding so that small (≤512px) atlases produce
+        # crisp 1024px output — interpolation works on the gradient, not
+        # on already-quantised pixel values.
+        if dimension <= 512:
+            gray = gray.resize((dimension * 2, dimension * 2), _Img.BILINEAR)
+        # SDF decode: remap the distance field so glyph edges become sharp.
+        # Values below SDF_LO → fully transparent (outside); above SDF_HI →
+        # fully opaque (inside); between → smooth anti-aliased edge.
+        SDF_LO, SDF_HI = 80, 176
+        span = SDF_HI - SDF_LO
+        gray = gray.point(lambda x: max(0, min(255,
+            int((x - SDF_LO) / span * 255))))
+        gray.save(path)
+    elif tex_fmt == 'bc1':
+        # BC1 (DXT1) hard-edge font atlases used by the PC version.
+        # color0=black (0x0000), color1=white (0xFFFF) in RGB565.
+        # No SDF gradient — just a binary/grayscale glyph mask.
+        mip0_size = max(dimension // 4, 1) ** 2 * 8
+        rgba = _t2d.decode_bc1(bc_data[:mip0_size], dimension, dimension)
+        img  = _Img.frombytes("RGBA", (dimension, dimension), rgba)
+        # R=G=B for grayscale BC1; use R channel as the glyph mask.
+        img.split()[0].save(path)
+    else:
+        mip0_size = max(dimension // 4, 1) ** 2 * 16
+        rgba = _t2d.decode_bc7(bc_data[:mip0_size], dimension, dimension)
+        _Img.frombytes("RGBA", (dimension, dimension), rgba).save(path)
 
 
-def export_texture_to_tga(bc7_data: bytes, dimension: int, path: str) -> None:
-    """Decode the top mip level of BC7 data and save as 32-bit TGA (bottom-up BGRA).
+def export_texture_to_tga(bc_data: bytes, dimension: int, path: str,
+                          tex_fmt: str = 'bc7') -> None:
+    """Decode the top mip level and save as TGA.
 
-    Follows MetroEX SaveAsTGA layout:
-      18-byte TGA header (type 2 = uncompressed true-color, 32 bpp)
-      pixel rows written bottom-to-top, channels swapped RGBA→BGRA.
+    tex_fmt 'bc7': 32-bit BGRA TGA, rows bottom-to-top (MetroEX SaveAsTGA layout).
+    tex_fmt 'bc4': 8-bit grayscale TGA (font atlases).
     """
     if not TEXDEC_OK:
         raise RuntimeError("pip install texture2ddecoder")
-    mip0_size = (dimension // 4) * (dimension // 4) * 16
-    rgba = _t2d.decode_bc7(bc7_data[:mip0_size], dimension, dimension)
-    with open(path, "wb") as f:
-        # TGA header (18 bytes): idlen=0, cmap=0, type=2, origin xy, dim, bpp, descriptor
-        f.write(struct.pack("<BBBHHBHHHHBB",
-                            0, 0, 2,        # idlen, cmap type, image type (2=RGB)
-                            0, 0, 0,         # x-origin, y-origin, colormap spec (unused)
-                            0, 0,            # colormap length & entry size (unused)
-                            dimension, dimension,  # width, height
-                            32, 0))          # bpp=32, image descriptor (origin top-left)
-        pitch = dimension * 4
-        for y in range(dimension - 1, -1, -1):
-            row = rgba[y * pitch:(y + 1) * pitch]
-            # RGBA → BGRA swap
-            for i in range(0, len(row), 4):
-                f.write(bytes([row[i + 2], row[i + 1], row[i], row[i + 3]]))
+    if tex_fmt in ('bc4', 'bc1'):
+        mip0_size = max(dimension // 4, 1) ** 2 * 8
+        if tex_fmt == 'bc4':
+            rgba = _t2d.decode_bc4(bc_data[:mip0_size], dimension, dimension)
+            # BC4 value is in the Blue channel
+            gray = bytes(rgba[i + 2] for i in range(0, len(rgba), 4))
+        else:
+            rgba = _t2d.decode_bc1(bc_data[:mip0_size], dimension, dimension)
+            # BC1 grayscale: use R channel
+            gray = bytes(rgba[i] for i in range(0, len(rgba), 4))
+        with open(path, "wb") as f:
+            # Type 3 = uncompressed black-and-white, 8 bpp
+            f.write(struct.pack("<BBBHHBHHHHBB",
+                                0, 0, 3, 0, 0, 0, 0, 0,
+                                dimension, dimension, 8, 0))
+            for y in range(dimension - 1, -1, -1):
+                f.write(gray[y * dimension:(y + 1) * dimension])
+    else:
+        mip0_size = (dimension // 4) ** 2 * 16
+        rgba = _t2d.decode_bc7(bc_data[:mip0_size], dimension, dimension)
+        with open(path, "wb") as f:
+            # Type 2 = uncompressed true-color, 32 bpp, bottom-left origin
+            f.write(struct.pack("<BBBHHBHHHHBB",
+                                0, 0, 2, 0, 0, 0, 0, 0,
+                                dimension, dimension, 32, 0))
+            pitch = dimension * 4
+            for y in range(dimension - 1, -1, -1):
+                row = rgba[y * pitch:(y + 1) * pitch]
+                for i in range(0, len(row), 4):
+                    f.write(bytes([row[i + 2], row[i + 1], row[i], row[i + 3]]))
 
 
-def _build_dds_header_dx10(dimension: int, num_mips: int) -> bytes:
-    """Build 124-byte DDSURFACEDESC2 + 20-byte DX10 header for BC7.
+def _build_dds_header_dx10(dimension: int, num_mips: int,
+                           dxgi_format: int = 98) -> bytes:
+    """Build 124-byte DDSURFACEDESC2 + 20-byte DX10 header.
 
+    dxgi_format: 98 = BC7_UNORM (default), 80 = BC4_UNORM (font atlases).
     Layout matches MetroEX DDS_MakeDX10Headers.
     """
-    w, h = dimension, dimension
     mip_count = max(1, num_mips)
 
     flags = 0x1 | 0x2 | 0x4 | 0x1000          # CAPS | HEIGHT | WIDTH | PIXELFORMAT
@@ -679,7 +808,7 @@ def _build_dds_header_dx10(dimension: int, num_mips: int) -> bytes:
 
     buf = bytearray()
     # ── DDSURFACEDESC2 (124 bytes) ──
-    buf += struct.pack("<7I", 124, flags, h, w, 0, 0, mip_count)
+    buf += struct.pack("<7I", 124, flags, dimension, dimension, 0, 0, mip_count)
     buf += b"\x00" * (11 * 4)                    # dwReserved1[11]
     buf += struct.pack("<2I", 32, 0x4)           # pfSize, pfFlags (DDPF_FOURCC)
     buf += struct.pack("<I", 0x30315844)          # dwFourCC = 'DX10'
@@ -687,7 +816,7 @@ def _build_dds_header_dx10(dimension: int, num_mips: int) -> bytes:
     buf += struct.pack("<5I", caps, 0, 0, 0, 0)  # caps, caps2-4, reserved2
 
     # ── DX10 header (20 bytes) ──
-    buf += struct.pack("<5I", 98, 3, 0, 1, 0)    # BC7_UNORM, TEXTURE2D, misc, arraySize, misc2
+    buf += struct.pack("<5I", dxgi_format, 3, 0, 1, 0)  # format, TEXTURE2D, misc, arraySize, misc2
     return bytes(buf)
 
 
@@ -711,26 +840,52 @@ def _build_dds_header_dx9(dimension: int) -> bytes:
     return bytes(buf)
 
 
-def export_texture_to_dds(bc7_data: bytes, dimension: int, num_mips: int,
-                          path: str) -> None:
-    """Save raw BC7 data as DDS with DX10 extended header (MetroEX SaveAsDDS)."""
-    hdr = _build_dds_header_dx10(dimension, num_mips)
+def export_texture_to_dds(bc_data: bytes, dimension: int, num_mips: int,
+                          path: str, tex_fmt: str = 'bc7') -> None:
+    """Save raw BC data as DDS with DX10 extended header.
+
+    tex_fmt 'bc7': DXGI_FORMAT_BC7_UNORM (98).
+    tex_fmt 'bc4': DXGI_FORMAT_BC4_UNORM (80) — PS4 SDF font atlases.
+    tex_fmt 'bc1': DXGI_FORMAT_BC1_UNORM (71) — PC hard-edge font atlases.
+    """
+    dxgi_map = {'bc4': 80, 'bc1': 71}
+    dxgi = dxgi_map.get(tex_fmt, 98)
+    hdr = _build_dds_header_dx10(dimension, num_mips, dxgi_format=dxgi)
     with open(path, "wb") as f:
-        f.write(b"\x44\x44\x53\x20")  # DDS signature
+        f.write(b"\x44\x44\x53\x20")  # DDS magic
         f.write(hdr)
-        f.write(bc7_data)
+        f.write(bc_data)
 
 
-def export_texture_to_legacy_dds(bc7_data: bytes, dimension: int,
-                                 path: str) -> None:
-    """Decode BC7 → RGBA, save as uncompressed RGBA DDS with DX9 header."""
+def export_texture_to_legacy_dds(bc_data: bytes, dimension: int,
+                                 path: str, tex_fmt: str = 'bc7') -> None:
+    """Decode BC → RGBA, save as uncompressed RGBA DDS with DX9 header."""
     if not TEXDEC_OK:
         raise RuntimeError("pip install texture2ddecoder")
-    mip0_size = (dimension // 4) * (dimension // 4) * 16
-    rgba = _t2d.decode_bc7(bc7_data[:mip0_size], dimension, dimension)
+    if tex_fmt == 'bc4':
+        mip0_size = max(dimension // 4, 1) ** 2 * 8
+        rgba_raw = _t2d.decode_bc4(bc_data[:mip0_size], dimension, dimension)
+        # BC4 value is in Blue channel; expand to RGBA grayscale
+        rgba = bytearray()
+        for i in range(0, len(rgba_raw), 4):
+            v = rgba_raw[i + 2]
+            rgba += bytes([v, v, v, 255])
+        rgba = bytes(rgba)
+    elif tex_fmt == 'bc1':
+        mip0_size = max(dimension // 4, 1) ** 2 * 8
+        rgba_raw = _t2d.decode_bc1(bc_data[:mip0_size], dimension, dimension)
+        # BC1 grayscale: R=G=B; expand to RGBA grayscale
+        rgba = bytearray()
+        for i in range(0, len(rgba_raw), 4):
+            v = rgba_raw[i]  # R channel
+            rgba += bytes([v, v, v, 255])
+        rgba = bytes(rgba)
+    else:
+        mip0_size = (dimension // 4) ** 2 * 16
+        rgba = _t2d.decode_bc7(bc_data[:mip0_size], dimension, dimension)
     hdr = _build_dds_header_dx9(dimension)
     with open(path, "wb") as f:
-        f.write(b"\x44\x44\x53\x20")  # DDS signature
+        f.write(b"\x44\x44\x53\x20")  # DDS magic
         f.write(hdr)
         f.write(rgba)
 
@@ -1509,21 +1664,31 @@ class App(ctk.CTk):
 
         def worker():
             try:
-                data = open(path, "rb").read()
+                with open(path, "rb") as _f:
+                    data = _f.read()
                 self._log(f"  file: {_fmt(len(data))}", "dim")
-                bc7 = parse_texture_512(data, dimension, num_mips)
-                if bc7 is None:
-                    raise ValueError("Cannot read texture — not a valid Metro BC7 or LZ4 file")
-                self._log(f"  BC7 data: {_fmt(len(bc7))}", "dim")
+                bc_data, tex_fmt_det, actual_dim = parse_texture_512(data, dimension, num_mips)
+                if bc_data is None:
+                    raise ValueError(
+                        "Cannot read texture — not a recognised Metro BC7/BC4/BC1 or LZ4 file\n"
+                        f"  file size {len(data)} B does not match any known format "
+                        f"for {dimension}×{dimension}")
+                fmt_label = tex_fmt_det.upper()
+                self._log(
+                    f"  {fmt_label} data: {_fmt(len(bc_data))}  ({actual_dim}×{actual_dim})",
+                    "dim")
+                # For PC font .512 → 1024×1024 BC4: only 1 top mip in the file
+                actual_num_mips = 1 if actual_dim != dimension else num_mips
                 if fmt == "png":
-                    export_texture_to_png(bc7, dimension, out_path)
+                    export_texture_to_png(bc_data, actual_dim, out_path, tex_fmt_det)
                 elif fmt == "dds":
-                    export_texture_to_dds(bc7, dimension, num_mips, out_path)
+                    export_texture_to_dds(bc_data, actual_dim, actual_num_mips,
+                                          out_path, tex_fmt_det)
                 elif fmt == "legacy_dds":
-                    export_texture_to_legacy_dds(bc7, dimension, out_path)
+                    export_texture_to_legacy_dds(bc_data, actual_dim, out_path, tex_fmt_det)
                 elif fmt == "tga":
-                    export_texture_to_tga(bc7, dimension, out_path)
-                msg = f"Exported {dimension}×{dimension} texture → {out_path}"
+                    export_texture_to_tga(bc_data, actual_dim, out_path, tex_fmt_det)
+                msg = f"Exported {actual_dim}×{actual_dim} {fmt_label} → {out_path}"
                 self._log("✓ " + msg, "ok")
                 self.after(0, lambda: self._status(msg))
                 self.after(0, lambda: messagebox.showinfo("Done", msg))
